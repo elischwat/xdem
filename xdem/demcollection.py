@@ -3,25 +3,22 @@ from __future__ import annotations
 
 import datetime
 import warnings
+from typing import Optional, Union
 
 import geoutils as gu
 import numpy as np
 import pandas as pd
 
 import xdem
-from xdem._typing import NDArrayf
 
 
 class DEMCollection:
     """A temporal collection of DEMs."""
 
-    def __init__(
-        self,
-        dems: list[gu.Raster] | list[xdem.DEM],
-        timestamps: list[datetime.datetime] | None = None,
-        outlines: gu.Vector | dict[datetime.datetime, gu.Vector] | None = None,
-        reference_dem: int | gu.Raster = 0,
-    ):
+    def __init__(self, dems: Union[list[gu.georaster.Raster], list[xdem.DEM]],
+                 timestamps: Optional[list[datetime.datetime]] = None,
+                 outlines: Optional[Union[gu.geovector.Vector, dict[datetime.datetime, gu.geovector.Vector]]] = None,
+                 reference_dem: Union[int, gu.georaster.Raster] = 0):
         """
         Create a new temporal DEM collection.
 
@@ -35,7 +32,7 @@ class DEMCollection:
         # If timestamps is not given, try to parse it from the (potential) 'datetime' attribute of each DEM.
         if timestamps is None:
             timestamp_attributes = [dem.datetime for dem in dems]
-            if any(stamp is None for stamp in timestamp_attributes):
+            if any([stamp is None for stamp in timestamp_attributes]):
                 raise ValueError("'timestamps' not provided and the given DEMs do not all have datetime attributes")
 
             timestamps = timestamp_attributes
@@ -50,28 +47,27 @@ class DEMCollection:
 
         # Find the sort indices from the timestamps
         indices = np.argsort(self.timestamps.astype("int64"))
-        self.dems = [dems[i] for i in indices]
+        self.dems = np.empty(len(dems), dtype=object)
+        self.dems[:] = [dems[i] for i in indices]
         self.ddems: list[xdem.dDEM] = []
         # The reference index changes place when sorted
         if isinstance(reference_dem, (int, np.integer)):
             self.reference_index = np.argwhere(indices == reference_dem)[0][0]
-        elif isinstance(reference_dem, gu.Raster):
+        elif isinstance(reference_dem, gu.georaster.Raster):
             self.reference_index = [i for i, dem in enumerate(self.dems) if dem is reference_dem][0]
 
         if outlines is None:
-            self.outlines: dict[np.datetime64, gu.Vector] = {}
-        elif isinstance(outlines, gu.Vector):
+            self.outlines: dict[np.datetime64, gu.geovector.Vector] = {}
+        elif isinstance(outlines, gu.geovector.Vector):
             self.outlines = {self.timestamps[self.reference_index]: outlines}
-        elif all(isinstance(value, gu.Vector) for value in outlines.values()):
+        elif all(isinstance(value, gu.geovector.Vector) for value in outlines.values()):
             self.outlines = dict(zip(np.array(list(outlines.keys())).astype("datetime64[ns]"), outlines.values()))
         else:
-            raise ValueError(
-                f"Invalid format on 'outlines': {type(outlines)},"
-                " expected one of ['gu.Vector', 'dict[datetime.datetime, gu.Vector']"
-            )
+            raise ValueError(f"Invalid format on 'outlines': {type(outlines)},"
+                             " expected one of ['gu.geovector.Vector', 'dict[datetime.datetime, gu.geovector.Vector']")
 
     @property
-    def reference_dem(self) -> gu.Raster:
+    def reference_dem(self) -> gu.georaster.Raster:
         """Get the DEM acting reference."""
         return self.dems[self.reference_index]
 
@@ -93,7 +89,7 @@ class DEMCollection:
         # Subtract every DEM that is available.
         for i, dem in enumerate(self.dems):
             # If the reference DEM is encountered, make a dDEM where dH == 0 (to keep length consistency).
-            if dem.raster_equal(self.reference_dem):
+            if dem == self.reference_dem:
                 ddem_raster = self.reference_dem.copy()
                 ddem_raster.data[:] = 0.0
                 ddem = xdem.dDEM(
@@ -107,14 +103,14 @@ class DEMCollection:
                     self.reference_dem - dem.reproject(resampling=resampling_method, silent=True),
                     start_time=min(self.reference_timestamp, self.timestamps[i]),
                     end_time=max(self.reference_timestamp, self.timestamps[i]),
-                    error=None,
+                    error=None
                 )
             ddems.append(ddem)
 
         self.ddems = ddems
         return self.ddems
 
-    def interpolate_ddems(self, method: str = "linear") -> list[NDArrayf]:
+    def interpolate_ddems(self, method="linear"):
         """
         Interpolate all the dDEMs in the DEMCollection object using the chosen interpolation method.
 
@@ -126,7 +122,7 @@ class DEMCollection:
 
         return [ddem.filled_data for ddem in self.ddems]
 
-    def get_ddem_mask(self, ddem: xdem.dDEM, outlines_filter: str | None = None) -> NDArrayf:
+    def get_ddem_mask(self, ddem: xdem.dDEM, outlines_filter: Optional[str] = None) -> np.ndarray:
         """
         Get a fitting dDEM mask for a provided dDEM.
 
@@ -155,23 +151,22 @@ class DEMCollection:
         # If both the start and end time outlines exist, a mask is created from their union.
         if ddem.start_time in outlines and ddem.end_time in outlines:
             mask = np.logical_or(
-                outlines[ddem.start_time].create_mask(ddem, as_array=True),
-                outlines[ddem.end_time].create_mask(ddem, as_array=True),
+                outlines[ddem.start_time].create_mask(ddem),
+                outlines[ddem.end_time].create_mask(ddem)
             )
         # If only start time outlines exist, these should be used as a mask
         elif ddem.start_time in outlines:
-            mask = outlines[ddem.start_time].create_mask(ddem, as_array=True)
+            mask = outlines[ddem.start_time].create_mask(ddem)
         # If only one outlines file exist, use that as a mask.
         elif len(outlines) == 1:
-            mask = list(outlines.values())[0].create_mask(ddem, as_array=True)
+            mask = list(outlines.values())[0].create_mask(ddem)
         # If no fitting outlines were found, make a full true boolean mask in its stead.
         else:
             mask = np.ones(shape=ddem.data.shape, dtype=bool)
         return mask.reshape(ddem.data.shape)
 
-    def get_dh_series(
-        self, outlines_filter: str | None = None, mask: NDArrayf | None = None, nans_ok: bool = False
-    ) -> pd.DataFrame:
+    def get_dh_series(self, outlines_filter: Optional[str] = None, mask: Optional[np.ndarray] = None,
+                      nans_ok: bool = False) -> pd.DataFrame:
         """
         Return a dataframe of mean dDEM values and respective areas for every timestamp.
 
@@ -186,7 +181,7 @@ class DEMCollection:
             raise ValueError("dDEMs have not yet been calculated")
 
         dh_values = pd.DataFrame(columns=["dh", "area"], dtype=float)
-        for _, ddem in enumerate(self.ddems):
+        for i, ddem in enumerate(self.ddems):
             # Skip if the dDEM is a self-comparison
             if float(ddem.time) == 0:
                 continue
@@ -207,9 +202,8 @@ class DEMCollection:
 
         return dh_values
 
-    def get_dv_series(
-        self, outlines_filter: str | None = None, mask: NDArrayf | None = None, nans_ok: bool = False
-    ) -> pd.Series:
+    def get_dv_series(self, outlines_filter: Optional[str] = None,
+                      mask: Optional[np.ndarray] = None, nans_ok: bool = False) -> pd.Series:
         """
         Return a series of mean volume change (dV) for every timestamp.
 
@@ -225,13 +219,9 @@ class DEMCollection:
 
         return dh_values["area"] * dh_values["dh"]
 
-    def get_cumulative_series(
-        self,
-        kind: str = "dh",
-        outlines_filter: str | None = None,
-        mask: NDArrayf | None = None,
-        nans_ok: bool = False,
-    ) -> pd.Series:
+    def get_cumulative_series(self, kind: str = "dh", outlines_filter: Optional[str] = None,
+                              mask: Optional[np.ndarray] = None,
+                              nans_ok: bool = False) -> pd.Series:
         """
         Get the cumulative dH (elevation) or dV (volume) since the first timestamp.
 
@@ -251,7 +241,7 @@ class DEMCollection:
         else:
             raise ValueError("Invalid argument: '{dh=}'. Choices: ['dh', 'dv']")
 
-        # Simplify the index to just "year" (implicitly still the same as above)
+        # Simplify the index to just "year" (implictly still the same as above)
         cumulative_dh = pd.Series(dtype=d_series.dtype)
         cumulative_dh[self.reference_timestamp] = 0.0
         for i, value in zip(d_series.index, d_series.values):

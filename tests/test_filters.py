@@ -1,10 +1,10 @@
 """Functions to test the filtering tools."""
 from __future__ import annotations
 
-import geoutils as gu
 import numpy as np
 import pytest
 
+import geoutils as gu
 import xdem
 
 
@@ -12,10 +12,10 @@ class TestFilters:
     """Test cases for the filter functions."""
 
     # Load example data.
-    dem_2009 = gu.Raster(xdem.examples.get_path("longyearbyen_ref_dem"))
-    dem_1990 = gu.Raster(xdem.examples.get_path("longyearbyen_tba_dem")).reproject(dem_2009, silent=True)
+    dem_2009 = gu.georaster.Raster(xdem.examples.get_path("longyearbyen_ref_dem"))
+    dem_1990 = gu.georaster.Raster(xdem.examples.get_path("longyearbyen_tba_dem")).reproject(dem_2009, silent=True)
 
-    def test_gauss(self) -> None:
+    def test_gauss(self):
         """Test applying the various Gaussian filters on DEMs with/without NaNs"""
 
         # Test applying scipy's Gaussian filter
@@ -31,7 +31,7 @@ class TestFilters:
         assert np.min(dem_array) < np.min(dem_sm2)
         assert np.max(dem_array) > np.max(dem_sm2)
         assert dem_array.shape == dem_sm2.shape
-
+        
         # Assert that both implementations yield similar results
         assert np.nanmax(np.abs(dem_sm - dem_sm2)) < 1e-3
 
@@ -51,7 +51,7 @@ class TestFilters:
         assert np.nanmax(dem_with_nans) > np.max(dem_sm)
 
         # Test that it works with 3D arrays
-        array_3d = np.vstack((dem_array[np.newaxis, :], dem_array[np.newaxis, :]))
+        array_3d = np.vstack((dem_array, dem_array))
         dem_sm = xdem.filters.gaussian_filter_scipy(array_3d, sigma=5)
         assert array_3d.shape == dem_sm.shape
 
@@ -59,11 +59,11 @@ class TestFilters:
         pytest.raises(NotImplementedError, xdem.filters.gaussian_filter_cv, array_3d, sigma=5)
 
         # Tests that it fails with 1D arrays with appropriate error
-        data = dem_array[:, 0]
+        data = dem_array[0, :, 0]
         pytest.raises(ValueError, xdem.filters.gaussian_filter_scipy, data, sigma=5)
         pytest.raises(ValueError, xdem.filters.gaussian_filter_cv, data, sigma=5)
 
-    def test_dist_filter(self) -> None:
+    def test_dist_filter(self):
         """Test that distance_filter works"""
 
         # Calculate dDEM
@@ -73,19 +73,19 @@ class TestFilters:
         count = 1000
         cols = np.random.randint(0, high=self.dem_1990.width - 1, size=count, dtype=int)
         rows = np.random.randint(0, high=self.dem_1990.height - 1, size=count, dtype=int)
-        ddem.data[rows, cols] = 5000
+        ddem.data[0, rows, cols] = 5000
 
         # Filter gross outliers
         filtered_ddem = xdem.filters.distance_filter(ddem.data, radius=20, outlier_threshold=50)
 
         # Check that all outliers were properly filtered
-        assert np.all(np.isnan(filtered_ddem[rows, cols]))
+        assert np.all(np.isnan(filtered_ddem[0, rows, cols]))
 
         # Assert that non filtered pixels remain the same
-        assert ddem.data.shape == filtered_ddem.shape
+        assert ddem.data.shape == filtered_ddem.shape        
         assert np.all(ddem.data[np.isfinite(filtered_ddem)] == filtered_ddem[np.isfinite(filtered_ddem)])
 
         # Check that it works with NaNs too
-        ddem.data[rows[:500], cols[:500]] = np.nan
+        ddem.data[0, rows[:500], cols[:500]] = np.nan
         filtered_ddem = xdem.filters.distance_filter(ddem.data, radius=20, outlier_threshold=50)
-        assert np.all(np.isnan(filtered_ddem[rows, cols]))
+        assert np.all(np.isnan(filtered_ddem[0, rows, cols]))
