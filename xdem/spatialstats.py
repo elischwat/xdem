@@ -31,6 +31,57 @@ with warnings.catch_warnings():
     import skgstat as skg
     from skgstat import models
 
+def volumetric_uncertainty(
+    n_pixels,
+    pixel_side_length,
+    rmse,
+    mean,
+    range_val,
+    sill_val
+):
+    """
+    Calculation for volumetric uncertainty that incorporates an estimate of 
+    uncorrelated random errors, spatially correlated random errors, and
+    systematic error. Requires the range and sill of a fitted spherical 
+    variogram model for the errors.
+
+    Args:
+        n_pixels (): number of pixels in measurement
+        pixel_side_length (): the sidelength or resolution of the pixel
+        rmse (): root mean squared error of dDEM dataset
+        mean (): mean error of dDEM dataset
+        range_val (): range of a fitted spherical variogram model (i.e. the lag-distance at which the relationship between variance and lag-distance flattens/stops increasing)
+        sill_val (): sill of a fitted spherical variogram model (i.e. the maximum variance reached at some distance defined by the range)
+
+    Anderson, S. W. (2019). Uncertainty in quantitative analyses of topographic change: Error propagation and the role of thresholding. Earth Surface Processes and Landforms, 44(5), 1015–1033. https://doi.org/10.1002/esp.4551
+    """
+    return n_pixels*(pixel_side_length**2)*np.sqrt(
+        rmse**2/n_pixels + mean**2 + (
+            sill_val/n_pixels
+        )*(
+            np.pi*range_val**2/(5*pixel_side_length**2)
+        )
+    )
+
+def rmse(data: numpy.ma.core.MaskedArray):
+    """
+    Calculate the root mean squared error of difference values.
+    It is assumed that the data parameter contains difference values over stable
+    areas and that the truth for these values is 0.
+    
+    Args:
+        data (numpy.ma.core.MaskedArray): _description_
+    """
+    if isinstance(data, np.ma.masked_array):
+        x = data[~data.mask]
+        x = x**2
+        return np.sqrt(np.nansum(x)/x.count())
+    else:
+        x = data
+        x = x**2
+        return np.sqrt(np.nansum(x)/np.count_nonzero(~np.isnan(data)))
+        
+
 def nmad(data: np.ndarray, nfact: float = 1.4826) -> float:
     """
     Calculate the normalized median absolute deviation (NMAD) of an array.

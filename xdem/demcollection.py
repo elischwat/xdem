@@ -17,7 +17,7 @@ class DEMCollection:
 
     def __init__(self, dems: Union[list[gu.georaster.Raster], list[xdem.DEM]],
                  timestamps: Optional[list[datetime.datetime]] = None,
-                 outlines: Optional[Union[gu.geovector.Vector, dict[datetime.datetime, gu.geovector.Vector]]] = None,
+                 outlines: Optional[Union[gu.geovector.Vector, dict[datetime.datetime, gu.geovector.Vector], dict[pd.Interval, gu.geovector.Vector]]] = None,
                  reference_dem: Union[int, gu.georaster.Raster] = 0):
         """
         Create a new temporal DEM collection.
@@ -50,6 +50,7 @@ class DEMCollection:
         self.dems = np.empty(len(dems), dtype=object)
         self.dems[:] = [dems[i] for i in indices]
         self.ddems: list[xdem.dDEM] = []
+        self.ddems_are_intervalwise = False
         # The reference index changes place when sorted
         if isinstance(reference_dem, (int, np.integer)):
             self.reference_index = np.argwhere(indices == reference_dem)[0][0]
@@ -65,6 +66,38 @@ class DEMCollection:
         else:
             raise ValueError(f"Invalid format on 'outlines': {type(outlines)},"
                              " expected one of ['gu.geovector.Vector', 'dict[datetime.datetime, gu.geovector.Vector']")
+
+    @classmethod
+    def from_files(cls, 
+                    dem_filename_list, 
+                    dem_datetime_list, 
+                    reference_dem_date, 
+                    bounds_vector, 
+                    dst_res,
+                    resampling)-> xdem.DEMCollection:
+        """
+        Create a new temporal DEM collection. 
+        Args:
+            dem_filename_list (list(str)): _description_
+            dem_datetime_list (list(datetime)): _description_
+            reference_dem_date (datetime): _description_
+            bounds_vector (gu.Vector): vector containing bounds to crop all DEMs to
+            dst_res (int): resolution for all dDEMS. If none is specified, the reference DEM resolution is used.
+
+        Returns:
+            _type_: A new DEMCollection instance.
+        """
+        assert len(dem_filename_list) == len(dem_datetime_list)
+        reference_dem_index = dem_datetime_list.index(reference_dem_date)
+        dem_list = [xdem.DEM(fn, datetime=dt) for (fn, dt) in zip(dem_filename_list, dem_datetime_list)]
+        ref_dem = dem_list[reference_dem_index]
+        if bounds_vector:
+            _ = ref_dem.crop(bounds_vector)
+        ref_dem = ref_dem.reproject(dst_res=dst_res, resampling=resampling)
+        dem_list = [dem.reproject(ref_dem, resampling=resampling) for dem in dem_list]
+        for dem,dt in zip(dem_list, dem_datetime_list):
+            dem.datetime = dt
+        return cls(dem_list, reference_dem=reference_dem_index)
 
     @property
     def reference_dem(self) -> gu.georaster.Raster:
@@ -109,18 +142,65 @@ class DEMCollection:
 
         self.ddems = ddems
         return self.ddems
+    
+    def subtract_dems_intervalwise(self, create_bounding_dod: bool = False) -> list[xdem.dDEM]:
+        """
+        Generate dDEMs by subtracting sequential pairs of DEMs as to create a "time series" of dDEMs.
 
-    def interpolate_ddems(self, method="linear"):
+        Has side effect of making self.dems sorted by datetime.
+
+        :returns: A list of dDEM objects.
+        """
+        ddems: list[xdem.dDEM] = []
+
+        self.dems = sorted(self.dems, key=lambda x: x.datetime)
+
+        for first_dem, last_dem in zip(self.dems, self.dems[1:]):
+            ddem = xdem.dDEM(
+                last_dem - first_dem,
+                start_time = first_dem.datetime,
+                end_time = last_dem.datetime,
+                error = 0
+            )
+            ddems.append(ddem)
+        if create_bounding_dod:
+            bounding_interval = pd.Interval(pd.Timestamp(self.timestamps[0]), pd.Timestamp(self.timestamps[-1]))
+            bounding_outlines = self.outlines.get(bounding_interval)
+
+            bounding_dem_collection = xdem.DEMCollection(
+                [self.dems[0], self.dems[-1]],
+                [self.timestamps[0], self.timestamps[-1]],
+                outlines = bounding_outlines
+            )
+
+            _ = bounding_dem_collection.subtract_dems_intervalwise()
+
+            ddems.append(
+                bounding_dem_collection.ddems[0]
+            )
+        
+        self.ddems = ddems
+        self.ddems_are_intervalwise = True
+        return self.ddems
+
+    def interpolate_ddems(self, method="linear", max_search_distance=10):
         """
         Interpolate all the dDEMs in the DEMCollection object using the chosen interpolation method.
 
         :param method: The chosen interpolation method.
+        :param max_search_distance: int. Only applicable for linear method of interpolation.
         """
         # TODO: Change is loop to run concurrently
         for ddem in self.ddems:
-            ddem.interpolate(method=method, reference_elevation=self.reference_dem, mask=self.get_ddem_mask(ddem))
+            ddem.interpolate(method=method, reference_elevation=self.reference_dem, mask=self.get_ddem_mask(ddem), max_search_distance=max_search_distance)
 
         return [ddem.filled_data for ddem in self.ddems]
+
+    def set_ddem_filled_data(self):
+        """Set the filled (interpolated) data as the data for all ddems.
+        """
+        [ddem.set_filled_data() for ddem in self.ddems]
+    
 
     def get_ddem_mask(self, ddem: xdem.dDEM, outlines_filter: Optional[str] = None) -> np.ndarray:
         """
@@ -129,6 +209,7 @@ class DEMCollection:
         The mask is created by evaluating these factors, in order:
 
         If self.outlines do not exist, a full True boolean mask is returned.
+        If self.outlines have keys that are pd.Intervals (of start and end times), then the interval of the ddem is used to query the polygons. 
         If self.outlines have keys for the start and end time, their union is returned.
         If self.outlines only have contain the start_time, its mask is returned.
         If len(self.outlines) == 1, the mask of that outline is returned.
@@ -143,13 +224,24 @@ class DEMCollection:
 
         if outlines_filter is None:
             outlines = self.outlines
-        else:
+        elif type(self.outlines) == dict:
             outlines = {key: gu.Vector(outline.ds.copy()) for key, outline in self.outlines.items()}
             for key in outlines:
                 outlines[key].ds = outlines[key].ds.query(outlines_filter)
+        elif type(self.outlines) == gu.Vector:
+            outlines = self.outlines.query(outlines_filter)
 
+        # If the outlines are a gu.Vector
+        if type(outlines) == gu.Vector:
+            mask = outlines.create_mask(ddem)
+        # If the outlines are a dictionary with pd.Intervals as keys
+        elif outlines and type(list(outlines.keys())[0]) == pd.Interval:
+            if len(outlines[ddem.interval].ds):
+                mask = outlines[ddem.interval].create_mask(ddem)
+            else:
+                mask = ~np.ones(shape=ddem.data.shape, dtype=bool)
         # If both the start and end time outlines exist, a mask is created from their union.
-        if ddem.start_time in outlines and ddem.end_time in outlines:
+        elif ddem.start_time in outlines and ddem.end_time in outlines:
             mask = np.logical_or(
                 outlines[ddem.start_time].create_mask(ddem),
                 outlines[ddem.end_time].create_mask(ddem)
@@ -183,27 +275,66 @@ class DEMCollection:
         dh_values = pd.DataFrame(columns=["dh", "area"], dtype=float)
         for i, ddem in enumerate(self.ddems):
             # Skip if the dDEM is a self-comparison
-            if float(ddem.time) == 0:
-                continue
+            if not self.ddems_are_intervalwise:
+                if float(ddem.time) == 0:
+                    continue
 
             # Use the provided mask unless it's None, otherwise make a dDEM mask.
             ddem_mask = mask if mask is not None else self.get_ddem_mask(ddem, outlines_filter=outlines_filter)
 
             # Warn if the dDEM contains nans and that's not okay
+            # Does this conditional actually guarantee therre arer nans? Its possible filled_data is None and 
+            #  and data does not have nans!
             if ddem.filled_data is None and not nans_ok:
                 warnings.warn(f"NaNs found in dDEM ({ddem.start_time} - {ddem.end_time}).")
 
             data = ddem.data[ddem_mask] if ddem.filled_data is None else ddem.filled_data[ddem_mask]
 
-            mean_dh = np.nanmean(data)
+            # This line will through an error if all values are masked in data
+            #     mean_dh = np.nanmean(data)
+            # Updated if clause fixes.
+            """
+            
+            File ~/.conda/envs/xdem/lib/python3.9/site-packages/numpy/lib/nanfunctions.py:950, in nanmean(a, axis, dtype, out, keepdims)
+                948 cnt = np.sum(~mask, axis=axis, dtype=np.intp, keepdims=keepdims)
+                949 tot = np.sum(arr, axis=axis, dtype=dtype, out=out, keepdims=keepdims)
+            --> 950 avg = _divide_by_count(tot, cnt, out=out)
+                952 isbad = (cnt == 0)
+                953 if isbad.any():
+
+            File ~/.conda/envs/xdem/lib/python3.9/site-packages/numpy/lib/nanfunctions.py:212, in _divide_by_count(a, b, out)
+                210 if isinstance(a, np.ndarray):
+                211     if out is None:
+            --> 212         return np.divide(a, b, out=a, casting='unsafe')
+                213     else:
+                214         return np.divide(a, b, out=out, casting='unsafe')
+
+            ValueError: output array is read-only
+            """
+            if isinstance(data, np.ma.MaskedArray):
+                if data.mask.all():
+                    mean_dh = 0 
+                else:
+                    mean_dh = np.nanmean(data)
+            else:
+                mean_dh = np.nanmean(data)
+                
             area = np.count_nonzero(ddem_mask) * self.reference_dem.res[0] * self.reference_dem.res[1]
 
             dh_values.loc[pd.Interval(pd.Timestamp(ddem.start_time), pd.Timestamp(ddem.end_time))] = mean_dh, area
 
         return dh_values
+    
+    def mask_ddems(self, mask_vector: gu.Vector):
+        for ddem in self.ddems:
+            mask = mask_vector.create_mask(ddem)
+            ddem.data.mask = np.logical_or(ddem.data.mask, mask)
+        
+    def mask_dems(self):
+        return None
 
     def get_dv_series(self, outlines_filter: Optional[str] = None,
-                      mask: Optional[np.ndarray] = None, nans_ok: bool = False) -> pd.Series:
+                      mask: Optional[np.ndarray] = None, nans_ok: bool = False, return_area: bool = False) -> Union[pd.Series, pd.DataFrame]:
         """
         Return a series of mean volume change (dV) for every timestamp.
 
@@ -216,8 +347,11 @@ class DEMCollection:
         :returns: A series of dV values with an Interval[Timestamp] index.
         """
         dh_values = self.get_dh_series(outlines_filter=outlines_filter, mask=mask, nans_ok=nans_ok)
-
-        return dh_values["area"] * dh_values["dh"]
+        if return_area:
+            dh_values["volume"] = dh_values["area"] * dh_values["dh"]
+            return dh_values
+        else:
+            return dh_values["area"] * dh_values["dh"]
 
     def get_cumulative_series(self, kind: str = "dh", outlines_filter: Optional[str] = None,
                               mask: Optional[np.ndarray] = None,
@@ -254,3 +388,67 @@ class DEMCollection:
         cumulative_dh -= cumulative_dh.iloc[0]
 
         return cumulative_dh
+
+    def plot_dems(self, max_cols = 4, figsize = (30,16), sharey=True, sharex=True, hillshade=False, cmap="terrain", interpolation=None):
+        import matplotlib.pyplot as plt
+        import math
+        fig, axes = plt.subplots(
+            math.ceil(len(self.dems)/max_cols), 
+            max_cols, 
+            figsize=figsize, 
+            sharex=sharex,
+            sharey=sharey            
+        )
+        axes_flat = axes.flatten()
+        for dem, ax in zip(self.dems, axes_flat):
+            alpha = 1.0
+            if hillshade:
+                hillshade_data = xdem.terrain.hillshade(dem.data, resolution=dem.res, azimuth=315.0, altitude=45.0)
+                ax.imshow(hillshade_data.squeeze(), cmap = "Greys_r", interpolation=interpolation)
+                alpha = 0.5
+            ax.imshow(dem.data.squeeze(), cmap="terrain", alpha=alpha)
+            ax.set_title(dem.datetime.strftime("%Y/%m/%d"))
+        #remove plot grid from unused axes
+        n_empty_plots = len(axes_flat) - len(self.dems)
+        for i   in range(1, n_empty_plots + 1):
+            axes_flat[-i].set_axis_off()
+        return fig, axes
+
+    def plot_ddems(self, max_cols = 4, figsize = (30,16), sharey=True, sharex=True, hillshade=False, cmap="RdYlBu", vmin=-30, vmax=30, cmap_alpha = 1.0, interpolation=None, plot_outlines=False, edgecolor='k', linewidth=1):
+        import matplotlib.pyplot as plt
+        import math
+        fig, axes = plt.subplots(
+            math.ceil(len(self.ddems)/max_cols), 
+            max_cols, 
+            figsize=figsize, 
+            sharex=sharex,
+            sharey=sharey   
+        )
+        axes_flat = axes.flatten()
+        for (i,ax), ddem in zip(enumerate(axes_flat), self.ddems):
+            ddem_xr = ddem.to_xarray()
+
+            if hillshade:
+                hillshade_xr = ddem_xr.copy()
+                hillshade_xr.data = xdem.terrain.hillshade(self.dems[i].data, resolution=self.dems[i].res, azimuth=315.0, altitude=45.0)
+                hillshade_xr.plot(ax=ax, cmap = "Greys_r", add_colorbar=False)
+            
+            ddem_xr.data = ddem.data.filled(np.nan) # THIS IS NECESSARY BECAUSE THE to_xarray() FUNCTION PASSES A DATASET READER - NOT THE ACTUAL DATA
+            # ddem_xr = ddem_xr.where(ddem_xr.data != ddem_xr.attrs['_FillValue'])  
+            ddem_xr.plot(ax=ax, cmap=cmap, vmin=vmin, vmax=vmax, alpha=cmap_alpha)
+            ax.set_title(
+                pd.to_datetime(ddem.start_time).strftime("%Y/%m/%d") + '-\n' + pd.to_datetime(ddem.end_time).strftime("%Y/%m/%d")
+                )
+            if plot_outlines:
+                # if outlines are a dictionary of pd.Intervals to gu.Vector objects, pick the interval that matches the ddem
+                if type(self.outlines) == dict and type(list(self.outlines.keys())[0]) == pd.Interval:
+                    self.outlines[ddem.interval].ds.plot(ax=ax, facecolor="none", edgecolor=edgecolor, linewidth=linewidth)
+                # If outlines are just a gu.Vector object, plot it no matter the ddem plotted here
+                elif type(self.outlines) == gu.geovector.Vector:
+                    self.outlines.ds.plot(ax=ax, facecolor="none", edgecolor=edgecolor, linewidth=linewidth)
+                
+        #remove plot grid from unused axes
+        n_empty_plots = len(axes_flat) - len(self.ddems)
+        for i in range(1, n_empty_plots + 1):
+            axes_flat[-i].set_axis_off()
+        return fig, axes

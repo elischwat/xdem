@@ -9,6 +9,7 @@ import geoutils as gu
 from geoutils import spatial_tools
 import numpy as np
 import shapely
+import pandas as pd
 
 import xdem
 
@@ -43,7 +44,7 @@ class dDEM(xdem.dem.DEM):   # pylint: disable=invalid-name
 
     def copy(self) -> dDEM:
         """Return a copy of the DEM."""
-        new_ddem = dDEM.from_array(self.data.copy(), self.transform, self.crs, self.start_time, self.end_time)
+        new_ddem = dDEM.from_array(self.data.copy(), self.transform, self.crs, self.start_time, self.end_time, nodata=self.nodata)
         return new_ddem
 
     @property
@@ -70,6 +71,18 @@ class dDEM(xdem.dem.DEM):   # pylint: disable=invalid-name
 
         self._filled_data = np.asarray(array).reshape(self.data.shape)
 
+    def set_filled_data(self):
+        """Set the filled (interpolated) data as the data.
+        """
+        # we ensure that the former mask is enforced. This necessary because during interpolation,
+        # masked pixels may have been filled and we want to maintain the existing mask.
+        if self._filled_data is not None:
+            if isinstance(self._filled_data, np.ma.MaskedArray):
+                self.data = self._filled_data
+            else:
+                self.data = np.ma.masked_invalid(self._filled_data)
+            
+        
     @property
     def fill_method(self) -> str:
         """Return the fill method used for the filled_data."""
@@ -79,8 +92,13 @@ class dDEM(xdem.dem.DEM):   # pylint: disable=invalid-name
     def time(self) -> np.timedelta64:
         """Get the time duration."""
         return self.end_time - self.start_time
+    
+    @property
+    def interval(self) -> pd.Interval:
+        """Get a pd.Interval object containing the start and end dates)"""
+        return pd.Interval(pd.to_datetime(self.start_time), pd.to_datetime(self.end_time))
 
-    def from_array(data: np.ndarray, transform, crs, start_time, end_time, error=None, nodata=None) -> dDEM:
+    def from_array(data: np.ndarray, transform, crs, start_time, end_time, error=None, nodata=None, filled_data=None) -> dDEM:
         """
         Create a new dDEM object from an array.
 
@@ -94,7 +112,7 @@ class dDEM(xdem.dem.DEM):   # pylint: disable=invalid-name
 
         :returns: A new dDEM instance.
         """
-        return dDEM(
+        ddem = dDEM(
             gu.georaster.Raster.from_array(
                 data=data,
                 transform=transform,
@@ -105,15 +123,20 @@ class dDEM(xdem.dem.DEM):   # pylint: disable=invalid-name
             end_time=end_time,
             error=error,
         )
+        if filled_data:
+            ddem.filled_data(filled_data)
+        return ddem
 
     def interpolate(self, method: str = "linear",
                     reference_elevation: Optional[Union[np.ndarray, np.ma.masked_array, xdem.DEM]] = None,
-                    mask: Optional[Union[np.ndarray, xdem.DEM, gu.Vector]] = None):
+                    mask: Optional[Union[np.ndarray, xdem.DEM, gu.Vector]] = None,
+                    max_search_distance: int = 10):
         """
         Interpolate the dDEM using the given method.
 
         :param method: The method to use for interpolation.
         :param reference_elevation: Reference DEM. Only required for hypsometric approaches.
+        :param max_search_distance: int. Only applicable for linear method of interpolation.
         """
         if reference_elevation is not None:
             try:
@@ -131,7 +154,7 @@ class dDEM(xdem.dem.DEM):   # pylint: disable=invalid-name
             )
 
         if method == "linear":
-            self.filled_data = xdem.volume.linear_interpolation(self.data)
+            self.filled_data = xdem.volume.linear_interpolation(self.data, max_search_distance=max_search_distance)
         elif method == "local_hypsometric":
             assert reference_elevation is not None
             assert mask is not None
